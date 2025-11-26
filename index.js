@@ -4,25 +4,45 @@ require('dotenv').config();
 const express = require('express');
 const mongoose = require('mongoose');
 const cors = require('cors');
-const jwt = require('jsonwebtoken');
-const bcrypt = require('bcryptjs');
+const admin = require('firebase-admin');
 const { body, validationResult } = require('express-validator');
 
 const app = express();
 
 // Environment variables with fallbacks
 const MONGODB_URI = process.env.MONGODB_URI;
-const JWT_SECRET = process.env.JWT_SECRET;
 const PORT = process.env.PORT || 5000;
 const NODE_ENV = process.env.NODE_ENV || 'development';
 
 // Validate required environment variables
 if (!MONGODB_URI) {
-  console.error(' MONGODB_URI is required in environment variables');
+  console.error('❌ MONGODB_URI is required in environment variables');
   process.exit(1);
 }
-if (!JWT_SECRET) {
-  console.error(' JWT_SECRET is required in environment variables');
+
+// Initialize Firebase Admin SDK
+try {
+  const serviceAccount = {
+    type: process.env.FIREBASE_TYPE,
+    project_id: process.env.FIREBASE_PROJECT_ID,
+    private_key_id: process.env.FIREBASE_PRIVATE_KEY_ID,
+    private_key: process.env.FIREBASE_PRIVATE_KEY?.replace(/\\n/g, '\n'),
+    client_email: process.env.FIREBASE_CLIENT_EMAIL,
+    client_id: process.env.FIREBASE_CLIENT_ID,
+    auth_uri: process.env.FIREBASE_AUTH_URI,
+    token_uri: process.env.FIREBASE_TOKEN_URI,
+    auth_provider_x509_cert_url: process.env.FIREBASE_AUTH_PROVIDER_CERT_URL,
+    client_x509_cert_url: process.env.FIREBASE_CLIENT_CERT_URL,
+    universe_domain: process.env.FIREBASE_UNIVERSE_DOMAIN || 'googleapis.com'
+  };
+
+  admin.initializeApp({
+    credential: admin.credential.cert(serviceAccount)
+  });
+  
+  console.log('✅ Firebase Admin SDK initialized successfully');
+} catch (error) {
+  console.error('❌ Firebase Admin SDK initialization error:', error);
   process.exit(1);
 }
 
@@ -67,10 +87,10 @@ async function connectToDatabase() {
 
     await mongoose.connect(MONGODB_URI, options);
     cachedDb = mongoose.connection;
-    console.log(' MongoDB Connected Successfully');
+    console.log('✅ MongoDB Connected Successfully');
     return cachedDb;
   } catch (error) {
-    console.error(' MongoDB Connection Error:', error);
+    console.error('❌ MongoDB Connection Error:', error);
     throw error;
   }
 }
@@ -84,12 +104,13 @@ if (NODE_ENV !== 'production' || process.env.VERCEL !== '1') {
 
 // MongoDB Schemas
 const userSchema = new mongoose.Schema({
+  firebaseUid: { type: String, required: true, unique: true },
   email: { type: String, required: true, unique: true },
   name: { type: String, required: true },
   image: { type: String, default: '' },
-  googleId: { type: String, unique: true, sparse: true },
-  password: { type: String }, // For credential-based auth
-  createdAt: { type: Date, default: Date.now }
+  provider: { type: String, default: 'firebase' }, // 'google', 'email', etc.
+  createdAt: { type: Date, default: Date.now },
+  lastLogin: { type: Date, default: Date.now }
 });
 
 const blogPostSchema = new mongoose.Schema({
@@ -115,8 +136,8 @@ const blogPostSchema = new mongoose.Schema({
 const User = mongoose.model('User', userSchema);
 const BlogPost = mongoose.model('BlogPost', blogPostSchema);
 
-// JWT Middleware
-const authenticateToken = (req, res, next) => {
+// Firebase Authentication Middleware
+const authenticateFirebaseToken = async (req, res, next) => {
   const authHeader = req.headers['authorization'];
   const token = authHeader && authHeader.split(' ')[1];
 
@@ -124,13 +145,19 @@ const authenticateToken = (req, res, next) => {
     return res.status(401).json({ error: 'Access token required' });
   }
 
-  jwt.verify(token, JWT_SECRET, (err, user) => {
-    if (err) {
-      return res.status(403).json({ error: 'Invalid or expired token' });
-    }
-    req.user = user;
+  try {
+    // Verify Firebase ID token
+    const decodedToken = await admin.auth().verifyIdToken(token);
+    req.user = {
+      firebaseUid: decodedToken.uid,
+      email: decodedToken.email,
+      name: decodedToken.name || decodedToken.email?.split('@')[0]
+    };
     next();
-  });
+  } catch (error) {
+    console.error('Firebase token verification error:', error);
+    return res.status(403).json({ error: 'Invalid or expired token' });
+  }
 };
 
 // Database connection middleware for serverless functions
@@ -145,116 +172,80 @@ const ensureDbConnection = async (req, res, next) => {
 
 // ==================== AUTH ROUTES ====================
 
-// Register with credentials
-app.post('/api/auth/register', ensureDbConnection, [
-  body('email').isEmail().withMessage('Valid email required'),
-  body('name').trim().notEmpty().withMessage('Name required'),
-  body('password').isLength({ min: 6 }).withMessage('Password must be at least 6 characters')
-], async (req, res) => {
-  const errors = validationResult(req);
-  if (!errors.isEmpty()) {
-    return res.status(400).json({ errors: errors.array() });
-  }
-
+// Sync Firebase user with MongoDB (called after Firebase authentication on client)
+app.post('/api/auth/sync', ensureDbConnection, authenticateFirebaseToken, async (req, res) => {
   try {
-    const { email, name, password } = req.body;
+    const { firebaseUid, email, name, image, provider } = req.user;
 
-    const existingUser = await User.findOne({ email });
-    if (existingUser) {
-      return res.status(400).json({ error: 'Email already registered' });
-    }
-
-    const hashedPassword = await bcrypt.hash(password, 10);
-    const user = new User({ email, name, password: hashedPassword });
-    await user.save();
-
-    const token = jwt.sign({ userId: user._id, email: user.email }, JWT_SECRET, { expiresIn: '7d' });
-
-    res.status(201).json({
-      message: 'User registered successfully',
-      token,
-      user: { id: user._id, email: user.email, name: user.name, image: user.image }
-    });
-  } catch (error) {
-    res.status(500).json({ error: 'Server error during registration' });
-  }
-});
-
-// Login with credentials
-app.post('/api/auth/login', ensureDbConnection, [
-  body('email').isEmail().withMessage('Valid email required'),
-  body('password').notEmpty().withMessage('Password required')
-], async (req, res) => {
-  const errors = validationResult(req);
-  if (!errors.isEmpty()) {
-    return res.status(400).json({ errors: errors.array() });
-  }
-
-  try {
-    const { email, password } = req.body;
-
-    const user = await User.findOne({ email });
-    if (!user || !user.password) {
-      return res.status(401).json({ error: 'Invalid credentials' });
-    }
-
-    const isValidPassword = await bcrypt.compare(password, user.password);
-    if (!isValidPassword) {
-      return res.status(401).json({ error: 'Invalid credentials' });
-    }
-
-    const token = jwt.sign({ userId: user._id, email: user.email }, JWT_SECRET, { expiresIn: '7d' });
-
-    res.json({
-      message: 'Login successful',
-      token,
-      user: { id: user._id, email: user.email, name: user.name, image: user.image }
-    });
-  } catch (error) {
-    res.status(500).json({ error: 'Server error during login' });
-  }
-});
-
-// Google OAuth user sync (NextAuth will handle OAuth, this creates/updates user in our DB)
-app.post('/api/auth/google', ensureDbConnection, async (req, res) => {
-  try {
-    const { email, name, image, googleId } = req.body;
-
-    let user = await User.findOne({ email });
+    let user = await User.findOne({ firebaseUid });
     
     if (!user) {
-      user = new User({ email, name, image, googleId });
+      // Create new user
+      user = new User({
+        firebaseUid,
+        email,
+        name: name || email?.split('@')[0],
+        image: image || '',
+        provider: provider || 'firebase'
+      });
       await user.save();
+      console.log('✅ New user created:', email);
     } else {
-      user.name = name;
-      user.image = image;
-      user.googleId = googleId;
+      // Update existing user
+      user.name = name || user.name;
+      user.image = image || user.image;
+      user.lastLogin = Date.now();
       await user.save();
+      console.log('✅ User updated:', email);
     }
 
-    const token = jwt.sign({ userId: user._id, email: user.email }, JWT_SECRET, { expiresIn: '7d' });
-
     res.json({
-      message: 'Google authentication successful',
-      token,
-      user: { id: user._id, email: user.email, name: user.name, image: user.image }
+      message: 'User synced successfully',
+      user: {
+        id: user._id,
+        firebaseUid: user.firebaseUid,
+        email: user.email,
+        name: user.name,
+        image: user.image
+      }
     });
   } catch (error) {
-    res.status(500).json({ error: 'Server error during Google auth' });
+    console.error('User sync error:', error);
+    res.status(500).json({ error: 'Server error during user sync' });
   }
 });
 
-// Get current user
-app.get('/api/auth/me', ensureDbConnection, authenticateToken, async (req, res) => {
+// Get current user (with MongoDB data)
+app.get('/api/auth/me', ensureDbConnection, authenticateFirebaseToken, async (req, res) => {
   try {
-    const user = await User.findById(req.user.userId).select('-password');
+    const user = await User.findOne({ firebaseUid: req.user.firebaseUid });
+    
     if (!user) {
-      return res.status(404).json({ error: 'User not found' });
+      return res.status(404).json({ error: 'User not found in database' });
     }
-    res.json({ user });
+
+    res.json({
+      user: {
+        id: user._id,
+        firebaseUid: user.firebaseUid,
+        email: user.email,
+        name: user.name,
+        image: user.image,
+        createdAt: user.createdAt
+      }
+    });
   } catch (error) {
+    console.error('Get user error:', error);
     res.status(500).json({ error: 'Server error' });
   }
+});
+
+// Verify Firebase token (health check for auth)
+app.get('/api/auth/verify', authenticateFirebaseToken, (req, res) => {
+  res.json({
+    message: 'Token is valid',
+    user: req.user
+  });
 });
 
 // ==================== BLOG POST ROUTES ====================
@@ -307,6 +298,7 @@ app.get('/api/blogs', ensureDbConnection, async (req, res) => {
     
     res.json({ blogs: blogsWithCounts, total: blogsWithCounts.length });
   } catch (error) {
+    console.error('Get blogs error:', error);
     res.status(500).json({ error: 'Error fetching blog posts' });
   }
 });
@@ -332,12 +324,13 @@ app.get('/api/blogs/:id', ensureDbConnection, async (req, res) => {
       }
     });
   } catch (error) {
+    console.error('Get blog error:', error);
     res.status(500).json({ error: 'Error fetching blog post' });
   }
 });
 
 // Create new blog post (protected)
-app.post('/api/blogs', ensureDbConnection, authenticateToken, [
+app.post('/api/blogs', ensureDbConnection, authenticateFirebaseToken, [
   body('title').trim().notEmpty().withMessage('Title required'),
   body('excerpt').trim().notEmpty().isLength({ max: 150 }).withMessage('Excerpt required (max 150 chars)'),
   body('content').trim().notEmpty().withMessage('Content required'),
@@ -349,10 +342,16 @@ app.post('/api/blogs', ensureDbConnection, authenticateToken, [
   }
 
   try {
+    // Get MongoDB user ID from Firebase UID
+    const user = await User.findOne({ firebaseUid: req.user.firebaseUid });
+    if (!user) {
+      return res.status(404).json({ error: 'User not found. Please sync your account first.' });
+    }
+
     const { title, excerpt, content, category, tags, featuredImage, readTime, status } = req.body;
     
     const blogPost = new BlogPost({
-      authorId: req.user.userId,
+      authorId: user._id,
       title,
       excerpt,
       content,
@@ -373,12 +372,13 @@ app.post('/api/blogs', ensureDbConnection, authenticateToken, [
       blog: populatedBlog
     });
   } catch (error) {
+    console.error('Create blog error:', error);
     res.status(500).json({ error: 'Error creating blog post' });
   }
 });
 
 // Update blog post (protected, author only)
-app.put('/api/blogs/:id', ensureDbConnection, authenticateToken, async (req, res) => {
+app.put('/api/blogs/:id', ensureDbConnection, authenticateFirebaseToken, async (req, res) => {
   try {
     const blog = await BlogPost.findById(req.params.id);
     
@@ -386,7 +386,13 @@ app.put('/api/blogs/:id', ensureDbConnection, authenticateToken, async (req, res
       return res.status(404).json({ error: 'Blog post not found' });
     }
     
-    if (blog.authorId.toString() !== req.user.userId) {
+    // Get MongoDB user
+    const user = await User.findOne({ firebaseUid: req.user.firebaseUid });
+    if (!user) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+    
+    if (blog.authorId.toString() !== user._id.toString()) {
       return res.status(403).json({ error: 'Not authorized to update this post' });
     }
     
@@ -412,12 +418,13 @@ app.put('/api/blogs/:id', ensureDbConnection, authenticateToken, async (req, res
       blog: populatedBlog
     });
   } catch (error) {
+    console.error('Update blog error:', error);
     res.status(500).json({ error: 'Error updating blog post' });
   }
 });
 
 // Delete blog post (protected, author only)
-app.delete('/api/blogs/:id', ensureDbConnection, authenticateToken, async (req, res) => {
+app.delete('/api/blogs/:id', ensureDbConnection, authenticateFirebaseToken, async (req, res) => {
   try {
     const blog = await BlogPost.findById(req.params.id);
     
@@ -425,7 +432,13 @@ app.delete('/api/blogs/:id', ensureDbConnection, authenticateToken, async (req, 
       return res.status(404).json({ error: 'Blog post not found' });
     }
     
-    if (blog.authorId.toString() !== req.user.userId) {
+    // Get MongoDB user
+    const user = await User.findOne({ firebaseUid: req.user.firebaseUid });
+    if (!user) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+    
+    if (blog.authorId.toString() !== user._id.toString()) {
       return res.status(403).json({ error: 'Not authorized to delete this post' });
     }
     
@@ -433,14 +446,21 @@ app.delete('/api/blogs/:id', ensureDbConnection, authenticateToken, async (req, 
     
     res.json({ message: 'Blog post deleted successfully' });
   } catch (error) {
+    console.error('Delete blog error:', error);
     res.status(500).json({ error: 'Error deleting blog post' });
   }
 });
 
 // Get user's own blog posts (protected)
-app.get('/api/blogs/user/my-posts', ensureDbConnection, authenticateToken, async (req, res) => {
+app.get('/api/blogs/user/my-posts', ensureDbConnection, authenticateFirebaseToken, async (req, res) => {
   try {
-    const blogs = await BlogPost.find({ authorId: req.user.userId })
+    // Get MongoDB user
+    const user = await User.findOne({ firebaseUid: req.user.firebaseUid });
+    if (!user) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+
+    const blogs = await BlogPost.find({ authorId: user._id })
       .sort({ createdAt: -1 })
       .lean();
     
@@ -462,12 +482,13 @@ app.get('/api/blogs/user/my-posts', ensureDbConnection, authenticateToken, async
       }
     });
   } catch (error) {
+    console.error('Get user posts error:', error);
     res.status(500).json({ error: 'Error fetching user posts' });
   }
 });
 
 // Like/Unlike blog post (protected)
-app.post('/api/blogs/:id/like', ensureDbConnection, authenticateToken, async (req, res) => {
+app.post('/api/blogs/:id/like', ensureDbConnection, authenticateFirebaseToken, async (req, res) => {
   try {
     const blog = await BlogPost.findById(req.params.id);
     
@@ -475,7 +496,13 @@ app.post('/api/blogs/:id/like', ensureDbConnection, authenticateToken, async (re
       return res.status(404).json({ error: 'Blog post not found' });
     }
     
-    const userId = req.user.userId;
+    // Get MongoDB user
+    const user = await User.findOne({ firebaseUid: req.user.firebaseUid });
+    if (!user) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+    
+    const userId = user._id;
     const likeIndex = blog.likes.indexOf(userId);
     
     if (likeIndex > -1) {
@@ -490,6 +517,7 @@ app.post('/api/blogs/:id/like', ensureDbConnection, authenticateToken, async (re
       res.json({ message: 'Blog post liked', liked: true, likeCount: blog.likes.length });
     }
   } catch (error) {
+    console.error('Toggle like error:', error);
     res.status(500).json({ error: 'Error toggling like' });
   }
 });
@@ -512,6 +540,7 @@ app.get('/api/stats', ensureDbConnection, async (req, res) => {
       }
     });
   } catch (error) {
+    console.error('Get stats error:', error);
     res.status(500).json({ error: 'Error fetching stats' });
   }
 });
@@ -527,13 +556,18 @@ app.get('/api/categories', ensureDbConnection, async (req, res) => {
     
     res.json({ categories });
   } catch (error) {
+    console.error('Get categories error:', error);
     res.status(500).json({ error: 'Error fetching categories' });
   }
 });
 
 // Health check
 app.get('/api/health', (req, res) => {
-  res.json({ status: 'OK', message: 'Project FPV Backend is running!' });
+  res.json({ 
+    status: 'OK', 
+    message: 'Project FPV Backend is running with Firebase Authentication!',
+    timestamp: new Date().toISOString()
+  });
 });
 
 // 404 handler
@@ -559,7 +593,8 @@ if (process.env.VERCEL !== '1') {
     console.log(`🚀 Server running on http://localhost:${PORT}`);
     console.log(`📡 API ready at http://localhost:${PORT}/api`);
     console.log(`🌍 Environment: ${NODE_ENV}`);
+    console.log(`🔥 Firebase Authentication: Enabled`);
   });
 } else {
-  console.log('✅ Serverless function ready for Vercel');
+  console.log('✅ Serverless function ready for Vercel with Firebase');
 }
